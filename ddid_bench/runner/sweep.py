@@ -1,5 +1,0 @@
-"""
-Module placeholder.
-
-TODO: implement.
-"""
