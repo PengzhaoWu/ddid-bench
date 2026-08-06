@@ -1,0 +1,53 @@
+experiment:
+  name: B1_noisy_single_agent
+  schema_version: "0.1"
+  episode_count: 1000
+  horizon: 128
+  deterministic_torch: true
+
+environment:
+  width: 8
+  height: 8
+  obstacles: fixed_map_01
+  target_motion: static
+  risk_mode: known
+  target_prior: uniform
+
+agents:
+  count: 1
+  initial_poses:
+    - [0, 0]
+  collision_rule: block
+
+sensor:
+  type: binary_footprint
+  footprint_radius: 1
+  p_detection: 0.90
+  p_false_alarm: 0.02
+
+belief:
+  type: exact_histogram
+  update_order: canonical
+  log_space: true
+
+communication:
+  mode: local
+
+policy:
+  type: deterministic_frontier
+  alpha_information: 1.0
+  beta_distance: 0.15
+  gamma_risk: 0.5
+  duplicate_penalty: 0.2
+  tie_break: lexicographic
+
+reward:
+  step_cost: 1.0
+  risk_cost: 2.0
+  duplicate_cost: 0.1
+  collision_cost: 1.0
+  find_reward: 100.0
+
+seeds:
+  target: 104729
+  environment: 130363
