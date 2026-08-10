@@ -1,8 +1,12 @@
-"""Generate fixed canonical grid maps for DDID-Bench.
+"""Generate fixed 16x16 two-agent maps for DDID-Bench.
 
-Run this script once to create map YAML files and matching PNG
-visualizations. The generated YAML files should be committed to Git and
-reused unchanged in experiments.
+Each generated map contains:
+- a 16x16 grid;
+- two agent initial positions;
+- one static target;
+- random obstacles;
+- guaranteed reachability from both agents to the target;
+- a YAML file and matching PNG visualization.
 """
 
 from __future__ import annotations
@@ -20,69 +24,6 @@ from matplotlib.patches import Rectangle
 Coordinate = tuple[int, int]
 
 
-def generate_map(
-    *,
-    size: int,
-    obstacle_probability: float,
-    rng: random.Random,
-) -> dict[str, Any]:
-    """Generate one valid map with a reachable target."""
-
-    while True:
-        agent_start: Coordinate = (0, 0)
-        target_location: Coordinate = (size - 2, size - 2)
-
-        obstacles: set[Coordinate] = set()
-
-        for row in range(size):
-            for column in range(size):
-                coordinate = (row, column)
-
-                if coordinate in {
-                    agent_start,
-                    target_location,
-                }:
-                    continue
-
-                if rng.random() < obstacle_probability:
-                    obstacles.add(coordinate)
-
-        if _path_exists(
-            size=size,
-            start=agent_start,
-            target=target_location,
-            obstacles=obstacles,
-        ):
-            break
-
-    risk_field = [
-        [0.0 for _ in range(size)]
-        for _ in range(size)
-    ]
-
-    return {
-        "schema_version": "1.0",
-        "environment": {
-            "grid_size": [size, size],
-            "obstacles": [
-                [row, column]
-                for row, column in sorted(obstacles)
-            ],
-            "target_locations": [
-                list(target_location)
-            ],
-            "risk_field": risk_field,
-            "initial_exogenous_state": {},
-        },
-        "agents": {
-            "initial_poses": [
-                list(agent_start)
-            ],
-            "initial_health": [1.0],
-        },
-    }
-
-
 def _path_exists(
     *,
     size: int,
@@ -90,10 +31,10 @@ def _path_exists(
     target: Coordinate,
     obstacles: set[Coordinate],
 ) -> bool:
-    """Return whether the target is reachable from the start."""
+    """Return whether target is reachable from start."""
 
     frontier: deque[Coordinate] = deque([start])
-    visited = {start}
+    visited: set[Coordinate] = {start}
 
     movements = (
         (-1, 0),
@@ -132,11 +73,102 @@ def _path_exists(
     return False
 
 
+def generate_map(
+    *,
+    size: int,
+    obstacle_probability: float,
+    rng: random.Random,
+) -> dict[str, Any]:
+    """Generate one valid two-agent map."""
+
+    agent_0_start: Coordinate = (0, 0)
+    agent_1_start: Coordinate = (0, size - 1)
+
+    target_location: Coordinate = (
+        size - 2,
+        size // 2,
+    )
+
+    while True:
+        obstacles: set[Coordinate] = set()
+
+        protected_cells = {
+            agent_0_start,
+            agent_1_start,
+            target_location,
+        }
+
+        for row in range(size):
+            for column in range(size):
+                coordinate = (row, column)
+
+                if coordinate in protected_cells:
+                    continue
+
+                if rng.random() < obstacle_probability:
+                    obstacles.add(coordinate)
+
+        agent_0_reachable = _path_exists(
+            size=size,
+            start=agent_0_start,
+            target=target_location,
+            obstacles=obstacles,
+        )
+
+        agent_1_reachable = _path_exists(
+            size=size,
+            start=agent_1_start,
+            target=target_location,
+            obstacles=obstacles,
+        )
+
+        if agent_0_reachable and agent_1_reachable:
+            break
+
+    risk_field = [
+        [0.0 for _ in range(size)]
+        for _ in range(size)
+    ]
+
+    return {
+        "schema_version": "1.0",
+
+        "environment": {
+            "grid_size": [size, size],
+
+            "obstacles": [
+                [row, column]
+                for row, column in sorted(obstacles)
+            ],
+
+            "target_locations": [
+                list(target_location)
+            ],
+
+            "risk_field": risk_field,
+
+            "initial_exogenous_state": {},
+        },
+
+        "agents": {
+            "initial_poses": [
+                list(agent_0_start),
+                list(agent_1_start),
+            ],
+
+            "initial_health": [
+                1.0,
+                1.0,
+            ],
+        },
+    }
+
+
 def render_map(
     map_config: dict[str, Any],
     output_path: Path,
 ) -> None:
-    """Render a generated map as a PNG image."""
+    """Render one map as a PNG."""
 
     environment = map_config["environment"]
     agents = map_config["agents"]
@@ -154,13 +186,15 @@ def render_map(
     }
 
     agent_positions = {
-        tuple(position)
-        for position in agents["initial_poses"]
+        tuple(position): agent_id
+        for agent_id, position
+        in enumerate(agents["initial_poses"])
     }
 
-    fig, ax = plt.subplots(figsize=(6, 6))
+    fig, ax = plt.subplots(
+        figsize=(8, 8)
+    )
 
-    # Draw cells.
     for row in range(rows):
         for column in range(columns):
             coordinate = (row, column)
@@ -170,44 +204,49 @@ def render_map(
                 1,
                 1,
                 fill=False,
-                linewidth=1,
+                linewidth=0.8,
             )
+
             ax.add_patch(rectangle)
+
+            center_x = column + 0.5
+            center_y = row + 0.5
 
             if coordinate in obstacles:
                 ax.text(
-                    column + 0.5,
-                    row + 0.5,
+                    center_x,
+                    center_y,
                     "X",
                     ha="center",
                     va="center",
-                    fontsize=16,
+                    fontsize=9,
                     fontweight="bold",
                 )
 
             elif coordinate in targets:
                 ax.text(
-                    column + 0.5,
-                    row + 0.5,
+                    center_x,
+                    center_y,
                     "T",
                     ha="center",
                     va="center",
-                    fontsize=16,
+                    fontsize=11,
                     fontweight="bold",
                 )
 
             elif coordinate in agent_positions:
+                agent_id = agent_positions[coordinate]
+
                 ax.text(
-                    column + 0.5,
-                    row + 0.5,
-                    "A",
+                    center_x,
+                    center_y,
+                    f"A{agent_id}",
                     ha="center",
                     va="center",
-                    fontsize=16,
+                    fontsize=9,
                     fontweight="bold",
                 )
 
-    # Put row 0 at the top.
     ax.set_xlim(0, columns)
     ax.set_ylim(rows, 0)
 
@@ -233,7 +272,7 @@ def render_map(
     ax.set_title(
         map_config.get(
             "map_id",
-            "DDID-Bench Map",
+            "DDID-Bench 16x16 Map",
         )
     )
 
@@ -256,14 +295,16 @@ def generate_map_collection(
     seed: int,
     output_directory: Path,
 ) -> None:
-    """Generate and save a collection of fixed maps."""
+    """Generate and save fixed maps."""
 
     if count <= 0:
-        raise ValueError("count must be positive.")
-
-    if size not in {8, 16, 32}:
         raise ValueError(
-            "Supported map sizes are 8, 16, and 32."
+            "count must be positive."
+        )
+
+    if size != 16:
+        raise ValueError(
+            "This script is intended for 16x16 maps."
         )
 
     if not 0.0 <= obstacle_probability < 1.0:
@@ -278,18 +319,25 @@ def generate_map_collection(
 
     rng = random.Random(seed)
 
-    for map_index in range(1, count + 1):
+    for map_index in range(
+        1,
+        count + 1,
+    ):
         map_config = generate_map(
             size=size,
             obstacle_probability=obstacle_probability,
             rng=rng,
         )
 
-        map_config["map_id"] = f"map_{map_index:03d}"
+        map_config["map_id"] = (
+            f"map_{map_index:03d}"
+        )
 
         map_config["generation"] = {
             "collection_seed": seed,
             "map_index": map_index,
+            "agent_count": 2,
+            "target_count": 1,
         }
 
         yaml_path = (
@@ -304,15 +352,16 @@ def generate_map_collection(
 
         if yaml_path.exists():
             raise FileExistsError(
-                f"Refusing to overwrite existing map: {yaml_path}"
+                f"Refusing to overwrite existing map: "
+                f"{yaml_path}"
             )
 
         if png_path.exists():
             raise FileExistsError(
-                f"Refusing to overwrite existing image: {png_path}"
+                f"Refusing to overwrite existing image: "
+                f"{png_path}"
             )
 
-        # Save authoritative YAML.
         with yaml_path.open(
             "w",
             encoding="utf-8",
@@ -323,7 +372,6 @@ def generate_map_collection(
                 sort_keys=False,
             )
 
-        # Save human-readable visualization.
         render_map(
             map_config=map_config,
             output_path=png_path,
@@ -336,8 +384,8 @@ def generate_map_collection(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate fixed DDID-Bench maps "
-            "and PNG visualizations."
+            "Generate fixed 16x16 DDID-Bench maps "
+            "with two agents and one target."
         )
     )
 
@@ -345,13 +393,6 @@ def main() -> None:
         "--count",
         type=int,
         default=20,
-    )
-
-    parser.add_argument(
-        "--size",
-        type=int,
-        choices=(8, 16, 32),
-        default=8,
     )
 
     parser.add_argument(
@@ -369,14 +410,16 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("configs/maps/8x8"),
+        default=Path(
+            "configs/maps/16x16_two_agents"
+        ),
     )
 
     arguments = parser.parse_args()
 
     generate_map_collection(
         count=arguments.count,
-        size=arguments.size,
+        size=16,
         obstacle_probability=arguments.obstacle_probability,
         seed=arguments.seed,
         output_directory=arguments.output,

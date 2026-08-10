@@ -1,0 +1,74 @@
+schema_version: "0.1"
+
+experiment:
+  name: B1_noisy_single_agent
+  episode_count: 1000
+  horizon: 128
+  deterministic_torch: true
+
+environment:
+  map: configs/maps/8x8/map_001.yaml
+
+  target_motion: static
+  target_prior: uniform
+  risk_mode: known
+
+agents:
+  count: 1
+  collision_rule: block
+
+sensor:
+  type: binary_footprint
+  footprint_radius: 1
+  p_detection: 0.90
+  p_false_alarm: 0.02
+
+information:
+  tokenizer:
+    type: default
+
+  filter:
+    type: identity
+
+belief:
+  type: exact_histogram
+  update_order: canonical
+  log_space: true
+
+communication:
+  mode: local
+
+policy:
+  type: deterministic_frontier
+
+  alpha_information: 1.0
+  beta_distance: 0.15
+  gamma_risk: 0.5
+  duplicate_penalty: 0.2
+
+  tie_break: lexicographic
+
+reward:
+  step_cost: 1.0
+  risk_cost: 2.0
+  duplicate_cost: 0.1
+  collision_cost: 1.0
+  find_reward: 100.0
+
+logging:
+  step_records: true
+  observations: true
+  observation_tokens: true
+  beliefs: true
+  decision_states: true
+  actions: true
+  rewards: true
+  evaluator_hidden_state: true
+
+seeds:
+  target: 104729
+  environment: 130363
+  sensor_noise: 1548586
+  transition: 181081
+  graph: 196613
+  policy: 32452843
