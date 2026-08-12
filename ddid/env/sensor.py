@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, TypeAlias
+
+import yaml
 
 from ddid.domain.observation import Observation
 from ddid.domain.state import State
@@ -53,6 +56,24 @@ class BinaryFootprintSensor:
         if not 0.0 <= self.p_false_alarm <= 1.0:
             raise ValueError("p_false_alarm must be between 0 and 1")
 
+    @classmethod
+    def from_yaml(
+        cls,
+        config_path: str | Path,
+    ) -> BinaryFootprintSensor:
+        """Create a sensor from a DDID-Bench YAML configuration."""
+
+        with Path(config_path).open("r", encoding="utf-8") as file:
+            config = yaml.safe_load(file)
+
+        sensor_config = config["sensor"]
+
+        return cls(
+            footprint_radius=sensor_config["footprint_radius"],
+            p_detection=sensor_config["p_detection"],
+            p_false_alarm=sensor_config["p_false_alarm"],
+        )
+
     def observe(
         self,
         state: State,
@@ -61,12 +82,12 @@ class BinaryFootprintSensor:
     ) -> Observation:
         """Generate one noisy binary observation."""
 
-        if not 0 <= agent_id < len(state.agent_poses):
+        if not 0 <= agent_id < len(state.agent_positions):
             raise IndexError(f"Invalid agent_id: {agent_id}")
 
         random_source = rng if rng is not None else random
 
-        agent_position = state.agent_poses[agent_id]
+        agent_position = state.agent_positions[agent_id]
 
         target_in_footprint = (
             _manhattan_distance(
@@ -82,10 +103,7 @@ class BinaryFootprintSensor:
             else self.p_false_alarm
         )
 
-        detected = (
-            random_source.random()
-            < probability
-        )
+        detected = random_source.random() < probability
 
         return Observation(
             schema_version="0.1",

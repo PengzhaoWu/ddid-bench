@@ -35,41 +35,60 @@ class State:
     ``environment_conditions``, and ``platform_health`` implement the
     mathematical state in Section 4.2.
 
-    ``schema_version`` and ``provenance`` are software-contract metadata and
-    are not part of the mathematical state tuple.
+    ``schema_version`` and ``provenance`` are software-contract metadata
+    and are not part of the mathematical state tuple.
     """
 
     schema_version: str
     timestep: int
+
     target_location: Coordinate
     agent_positions: AgentPositions
     risk_field: RiskField
+
     environment_conditions: Metadata = field(default_factory=dict)
     platform_health: tuple[Metadata, ...] = ()
     provenance: Metadata = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate invariants and freeze mapping-valued fields."""
+
         if not self.schema_version.strip():
-            raise ValueError("schema_version must be a non-empty string")
+            raise ValueError(
+                "schema_version must be a non-empty string"
+            )
 
         if self.timestep < 0:
-            raise ValueError("timestep must be non-negative")
+            raise ValueError(
+                "timestep must be non-negative"
+            )
 
         if not self.agent_positions:
-            raise ValueError("agent_positions must contain at least one agent")
+            raise ValueError(
+                "agent_positions must contain at least one agent"
+            )
 
         if not self.risk_field or not self.risk_field[0]:
-            raise ValueError("risk_field must be a non-empty rectangular grid")
+            raise ValueError(
+                "risk_field must be a non-empty rectangular grid"
+            )
 
         width = len(self.risk_field[0])
         height = len(self.risk_field)
 
         for row in self.risk_field:
             if len(row) != width:
-                raise ValueError("risk_field must be rectangular")
-            if any(not 0.0 <= risk <= 1.0 for risk in row):
-                raise ValueError("risk values must lie in [0, 1]")
+                raise ValueError(
+                    "risk_field must be rectangular"
+                )
+
+            if any(
+                not 0.0 <= risk <= 1.0
+                for risk in row
+            ):
+                raise ValueError(
+                    "risk values must lie in [0, 1]"
+                )
 
         self._validate_coordinate(
             self.target_location,
@@ -78,7 +97,9 @@ class State:
             field_name="target_location",
         )
 
-        for index, position in enumerate(self.agent_positions):
+        for index, position in enumerate(
+            self.agent_positions
+        ):
             self._validate_coordinate(
                 position,
                 width=width,
@@ -86,27 +107,39 @@ class State:
                 field_name=f"agent_positions[{index}]",
             )
 
-        if self.platform_health and len(self.platform_health) != len(
-            self.agent_positions
+        if (
+            self.platform_health
+            and len(self.platform_health)
+            != len(self.agent_positions)
         ):
             raise ValueError(
-                "platform_health must be empty or contain one entry per agent"
+                "platform_health must be empty or "
+                "contain one entry per agent"
             )
 
         object.__setattr__(
             self,
             "environment_conditions",
-            _freeze_mapping(self.environment_conditions),
+            _freeze_mapping(
+                self.environment_conditions
+            ),
         )
+
         object.__setattr__(
             self,
             "platform_health",
-            tuple(_freeze_mapping(item) for item in self.platform_health),
+            tuple(
+                _freeze_mapping(item)
+                for item in self.platform_health
+            ),
         )
+
         object.__setattr__(
             self,
             "provenance",
-            _freeze_mapping(self.provenance),
+            _freeze_mapping(
+                self.provenance
+            ),
         )
 
     @staticmethod
@@ -117,11 +150,16 @@ class State:
         height: int,
         field_name: str,
     ) -> None:
-        """Validate that a coordinate lies inside the risk-field grid."""
+        """Validate that a coordinate lies inside the grid."""
+
         x, y = coordinate
 
-        if not (0 <= x < width and 0 <= y < height):
+        if not (
+            0 <= x < width
+            and 0 <= y < height
+        ):
             raise ValueError(
-                f"{field_name}={coordinate!r} is outside grid bounds "
+                f"{field_name}={coordinate!r} "
+                f"is outside grid bounds "
                 f"width={width}, height={height}"
             )
