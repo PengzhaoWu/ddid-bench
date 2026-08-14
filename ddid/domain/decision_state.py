@@ -23,7 +23,7 @@ class DecisionState:
     """Immutable policy-visible decision state."""
 
     schema_version: str
-    agent_id: str
+    agent_id: int
     timestep: int
 
     target_belief: tuple[float, ...]

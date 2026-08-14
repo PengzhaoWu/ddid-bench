@@ -1,15 +1,17 @@
 """Grid-world environment orchestration for DDID-Bench.
 
-This module loads a fixed benchmark instance from YAML, initializes the hidden
-simulator state, and coordinates the transition, reward, and sensor modules.
+This module loads a fixed benchmark instance from YAML, initializes the
+hidden simulator state, and coordinates transition and reward models.
 
-GridWorld does not implement transition rules, reward formulas, or sensor
-noise directly.
+GridWorld owns the hidden simulator State. Policies must never receive
+the hidden State directly.
+
+Sensing remains external: a Sensor observes the hidden State returned
+by GridWorld.
 """
 
 from __future__ import annotations
 
-import random
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
@@ -17,14 +19,13 @@ from typing import Any, Protocol
 import yaml
 
 from ddid.domain.action import Action
-from ddid.domain.observation import Observation
 from ddid.domain.state import Coordinate, State
 
 
 class TransitionModel(Protocol):
     """Required interface for a transition model."""
 
-    def apply(
+    def transition(
         self,
         state: State,
         action: Action,
@@ -36,35 +37,38 @@ class TransitionModel(Protocol):
 class RewardModel(Protocol):
     """Required interface for a reward model."""
 
-    def compute(
+    def reward(
         self,
         state: State,
         action: Action,
         next_state: State,
+        *,
+        duplicate_count: int = 0,
+        collision_count: int = 0,
     ) -> float:
-        """Compute the reward for one state transition."""
-        ...
-
-
-class SensorModel(Protocol):
-    """Required interface for a sensor model."""
-
-    def observe(
-        self,
-        state: State,
-        agent_id: int,
-        rng: random.Random | None = None,
-    ) -> Observation:
-        """Generate an observation for one agent."""
+        """Compute reward for one state transition."""
         ...
 
 
 class GridWorld:
     """DDID-Bench grid-world environment.
 
-    The environment loads one fixed YAML benchmark instance. Calling reset()
-    restores the initial state from that instance but does not regenerate or
-    modify the map.
+    The environment loads one fixed YAML benchmark instance.
+
+    Calling ``reset()`` restores the initial state from that instance.
+    The map itself is never regenerated or modified during an episode.
+
+    GridWorld coordinates:
+
+        Action
+            -> TransitionModel
+            -> next State
+            -> event detection
+            -> RewardModel
+            -> termination
+
+    Sensing, belief updates, communication, and policy decisions are
+    intentionally outside this class.
     """
 
     def __init__(
@@ -73,37 +77,48 @@ class GridWorld:
         instance_path: str | Path,
         transition_model: TransitionModel,
         reward_model: RewardModel,
-        sensor: SensorModel,
         max_steps: int = 100,
-        seed: int | None = None,
     ) -> None:
+        """Initialize the grid-world environment."""
+
         if max_steps <= 0:
-            raise ValueError("max_steps must be positive.")
+            raise ValueError(
+                "max_steps must be positive"
+            )
 
         self._instance_path = Path(instance_path)
         self._transition_model = transition_model
         self._reward_model = reward_model
-        self._sensor = sensor
         self._max_steps = max_steps
-        self._rng = random.Random(seed)
 
-        self._config = self._load_yaml(self._instance_path)
+        self._config = self._load_yaml(
+            self._instance_path
+        )
 
         self._state: State | None = None
+
         self._terminated = False
         self._truncated = False
+
+        # Simulator-side physical visitation history.
+        #
+        # This is used only for the current baseline definition of
+        # duplicate physical coverage. It is not automatically exposed
+        # to policies.
+        self._visited_cells: set[Coordinate] = set()
 
     @property
     def state(self) -> State:
         """Return the current hidden simulator state.
 
-        This property is intended for the simulator and testing code. Policies
-        should never receive the hidden state directly.
+        This property is intended for environment and testing code.
+        Policies must never receive the hidden state directly.
         """
 
         if self._state is None:
             raise RuntimeError(
-                "The environment has not been reset. Call reset() first."
+                "The environment has not been reset. "
+                "Call reset() first."
             )
 
         return self._state
@@ -116,7 +131,7 @@ class GridWorld:
 
     @property
     def map_id(self) -> str:
-        """Return the map identifier stored in the YAML file."""
+        """Return the map identifier."""
 
         return str(
             self._config.get(
@@ -127,25 +142,36 @@ class GridWorld:
 
     @property
     def grid_size(self) -> tuple[int, int]:
-        """Return the configured grid size as (rows, columns)."""
+        """Return grid size as (rows, columns)."""
 
         environment = self._require_mapping(
             self._config,
             "environment",
         )
 
-        raw_size = environment.get("grid_size")
+        raw_size = environment.get(
+            "grid_size"
+        )
 
         if (
-            not isinstance(raw_size, list | tuple)
+            not isinstance(
+                raw_size,
+                (list, tuple),
+            )
             or len(raw_size) != 2
         ):
             raise ValueError(
-                "environment.grid_size must contain exactly two values."
+                "environment.grid_size must contain "
+                "exactly two values."
             )
 
         rows = int(raw_size[0])
         columns = int(raw_size[1])
+
+        if rows <= 0 or columns <= 0:
+            raise ValueError(
+                "Grid dimensions must be positive."
+            )
 
         return rows, columns
 
@@ -158,7 +184,10 @@ class GridWorld:
             "environment",
         )
 
-        raw_obstacles = environment.get("obstacles", [])
+        raw_obstacles = environment.get(
+            "obstacles",
+            [],
+        )
 
         return frozenset(
             self._parse_coordinate(value)
@@ -167,61 +196,72 @@ class GridWorld:
 
     def reset(
         self,
-        *,
-        seed: int | None = None,
-        agent_id: int = 0,
-    ) -> tuple[Observation, Mapping[str, Any]]:
-        """Reset the episode using the unchanged YAML benchmark instance."""
+    ) -> tuple[State, Mapping[str, Any]]:
+        """Reset the episode to the fixed initial state.
 
-        if seed is not None:
-            self._rng.seed(seed)
+        Returns:
+            state:
+                Initial hidden simulator state.
+
+            info:
+                Simulator-side metadata. This is not policy input.
+        """
 
         self._state = self._build_initial_state()
+
         self._terminated = False
         self._truncated = False
 
-        self._validate_agent_id(
-            state=self._state,
-            agent_id=agent_id,
-        )
-
-        observation = self._sensor.observe(
-            state=self._state,
-            agent_id=agent_id,
-            rng=self._rng,
+        self._visited_cells = set(
+            self._state.agent_positions
         )
 
         info: Mapping[str, Any] = {
             "map_id": self.map_id,
             "timestep": self._state.timestep,
-            "agent_id": agent_id,
+            "target_found": self._is_terminated(
+                self._state
+            ),
         }
 
-        return observation, info
+        return self._state, info
 
     def step(
         self,
         action: Action,
-        *,
-        agent_id: int = 0,
     ) -> tuple[
-        Observation,
+        State,
         float,
         bool,
         bool,
         Mapping[str, Any],
     ]:
-        """Advance the environment by one timestep.
+        """Advance the hidden simulator state by one timestep.
+
+        GridWorld performs:
+
+        1. Action validation.
+        2. State transition.
+        3. Transition-output validation.
+        4. Duplicate/collision event detection.
+        5. Reward computation.
+        6. Termination/truncation checks.
+
+        Sensing is performed separately by the Sensor.
 
         Returns:
-            observation:
-                Noisy observation generated from the next hidden state.
+            next_state:
+                Hidden simulator state after the action.
+
             reward:
-                Reward associated with the transition.
+                Scalar reward associated with the transition.
+
             terminated:
                 Whether the mission termination condition was reached.
+
             truncated:
-                Whether the episode reached the step limit.
+                Whether the episode horizon was reached.
+
             info:
                 Simulator metadata that is not policy input.
         """
@@ -230,15 +270,16 @@ class GridWorld:
 
         if self._terminated or self._truncated:
             raise RuntimeError(
-                "The episode has ended. Call reset() before step()."
+                "The episode has ended. "
+                "Call reset() before step()."
             )
 
-        self._validate_agent_id(
-            state=current_state,
-            agent_id=agent_id,
+        self._validate_action(
+            current_state,
+            action,
         )
 
-        next_state = self._transition_model.apply(
+        next_state = self._transition_model.transition(
             state=current_state,
             action=action,
         )
@@ -248,19 +289,31 @@ class GridWorld:
             next_state=next_state,
         )
 
-        reward = self._reward_model.compute(
-            state=current_state,
+        duplicate_count = self._duplicate_count(
             action=action,
             next_state=next_state,
         )
 
-        observation = self._sensor.observe(
-            state=next_state,
-            agent_id=agent_id,
-            rng=self._rng,
+        collision_count = self._collision_count(
+            next_state
         )
 
-        self._terminated = self._is_terminated(next_state)
+        reward = self._reward_model.reward(
+            state=current_state,
+            action=action,
+            next_state=next_state,
+            duplicate_count=duplicate_count,
+            collision_count=collision_count,
+        )
+
+        self._update_visited_cells(
+            next_state
+        )
+
+        self._terminated = self._is_terminated(
+            next_state
+        )
+
         self._truncated = (
             not self._terminated
             and next_state.timestep >= self._max_steps
@@ -271,13 +324,14 @@ class GridWorld:
         info: Mapping[str, Any] = {
             "map_id": self.map_id,
             "timestep": next_state.timestep,
-            "agent_id": agent_id,
             "target_found": self._terminated,
             "time_limit_reached": self._truncated,
+            "duplicate_count": duplicate_count,
+            "collision_count": collision_count,
         }
 
         return (
-            observation,
+            next_state,
             float(reward),
             self._terminated,
             self._truncated,
@@ -285,20 +339,29 @@ class GridWorld:
         )
 
     def render(self) -> str:
-        """Return an ASCII representation of the current map."""
+        """Return an evaluator/debug ASCII representation.
+
+        This rendering exposes the hidden target location and therefore
+        must never be used as policy input.
+        """
 
         state = self.state
+
         rows, columns = self.grid_size
 
         agent_positions = {
-            coordinate: agent_id
-            for agent_id, coordinate in enumerate(state.agent_poses)
+            position: agent_id
+            for agent_id, position in enumerate(
+                state.agent_positions
+            )
         }
 
-        target_locations = set(state.target_locations)
         obstacles = self.obstacles
 
-        column_width = max(1, len(str(columns - 1)))
+        column_width = max(
+            1,
+            len(str(columns - 1)),
+        )
 
         header = (
             " " * (column_width + 2)
@@ -314,17 +377,22 @@ class GridWorld:
             symbols: list[str] = []
 
             for column in range(columns):
-                coordinate = (row, column)
+                coordinate = (
+                    column,
+                    row,
+                )
 
                 if coordinate in agent_positions:
-                    agent_id = agent_positions[coordinate]
+                    agent_id = agent_positions[
+                        coordinate
+                    ]
 
-                    if len(state.agent_poses) == 1:
+                    if len(state.agent_positions) == 1:
                         symbol = "A"
                     else:
                         symbol = str(agent_id)
 
-                elif coordinate in target_locations:
+                elif coordinate == state.target_location:
                     symbol = "T"
 
                 elif coordinate in obstacles:
@@ -345,31 +413,23 @@ class GridWorld:
         return "\n".join(rendered_rows)
 
     def _build_initial_state(self) -> State:
-        """Construct the initial hidden state from the loaded YAML."""
+        """Construct the initial hidden State from YAML."""
 
         environment = self._require_mapping(
             self._config,
             "environment",
         )
+
         agents = self._require_mapping(
             self._config,
             "agents",
         )
 
-        target_locations = tuple(
-            self._parse_coordinate(value)
-            for value in environment.get(
-                "target_locations",
-                [],
-            )
+        target_location = self._parse_target_location(
+            environment
         )
 
-        if not target_locations:
-            raise ValueError(
-                "The benchmark instance must contain at least one target."
-            )
-
-        agent_poses = tuple(
+        agent_positions = tuple(
             self._parse_coordinate(value)
             for value in agents.get(
                 "initial_poses",
@@ -377,37 +437,41 @@ class GridWorld:
             )
         )
 
-        if not agent_poses:
+        if not agent_positions:
             raise ValueError(
-                "The benchmark instance must contain at least one agent."
-            )
-
-        agent_health = tuple(
-            float(value)
-            for value in agents.get(
-                "initial_health",
-                [1.0] * len(agent_poses),
-            )
-        )
-
-        if len(agent_health) != len(agent_poses):
-            raise ValueError(
-                "initial_health must contain one value per agent."
+                "The benchmark instance must contain "
+                "at least one agent."
             )
 
         risk_field = self._parse_risk_field(
-            environment.get("risk_field")
+            environment.get(
+                "risk_field"
+            )
         )
 
-        exogenous_state = environment.get(
+        environment_conditions = environment.get(
             "initial_exogenous_state",
             {},
         )
 
-        if not isinstance(exogenous_state, Mapping):
+        if not isinstance(
+            environment_conditions,
+            Mapping,
+        ):
             raise TypeError(
-                "initial_exogenous_state must be a mapping."
+                "initial_exogenous_state "
+                "must be a mapping."
             )
+
+        raw_health = agents.get(
+            "initial_health",
+            [],
+        )
+
+        platform_health = self._parse_platform_health(
+            raw_health,
+            agent_count=len(agent_positions),
+        )
 
         return State(
             schema_version=str(
@@ -417,22 +481,91 @@ class GridWorld:
                 )
             ),
             timestep=0,
-            target_locations=target_locations,
-            agent_poses=agent_poses,
+            target_location=target_location,
+            agent_positions=agent_positions,
             risk_field=risk_field,
-            xi_t=dict(exogenous_state),
-            agent_health=agent_health,
-            metadata={
+            environment_conditions=dict(
+                environment_conditions
+            ),
+            platform_health=platform_health,
+            provenance={
                 "map_id": self.map_id,
-                "instance_path": str(self._instance_path),
-                "obstacles": tuple(sorted(self.obstacles)),
-                "generation": dict(
-                    self._config.get(
-                        "generation",
-                        {},
-                    )
+                "instance_path": str(
+                    self._instance_path
                 ),
             },
+        )
+
+    def _parse_target_location(
+        self,
+        environment: Mapping[str, Any],
+    ) -> Coordinate:
+        """Parse the single hidden target location.
+
+        Existing benchmark YAML files may use ``target_locations``.
+        The current State contract contains one ``target_location``,
+        so exactly one target is required.
+        """
+
+        if "target_location" in environment:
+            return self._parse_coordinate(
+                environment["target_location"]
+            )
+
+        raw_targets = environment.get(
+            "target_locations",
+            [],
+        )
+
+        if not isinstance(
+            raw_targets,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "environment.target_locations "
+                "must be a sequence."
+            )
+
+        if len(raw_targets) != 1:
+            raise ValueError(
+                "The current State contract supports "
+                "exactly one target location."
+            )
+
+        return self._parse_coordinate(
+            raw_targets[0]
+        )
+
+    def _parse_platform_health(
+        self,
+        value: Any,
+        *,
+        agent_count: int,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Convert YAML health data to State.platform_health."""
+
+        if value in (None, []):
+            return ()
+
+        if not isinstance(
+            value,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "agents.initial_health must be a sequence."
+            )
+
+        if len(value) != agent_count:
+            raise ValueError(
+                "initial_health must contain one "
+                "value per agent."
+            )
+
+        return tuple(
+            {
+                "health": float(health)
+            }
+            for health in value
         )
 
     def _parse_risk_field(
@@ -445,44 +578,68 @@ class GridWorld:
 
         if value is None:
             return tuple(
-                tuple(0.0 for _ in range(columns))
+                tuple(
+                    0.0
+                    for _ in range(columns)
+                )
                 for _ in range(rows)
             )
 
-        if not isinstance(value, list | tuple):
+        if not isinstance(
+            value,
+            (list, tuple),
+        ):
             raise TypeError(
-                "environment.risk_field must be a two-dimensional sequence."
+                "environment.risk_field must be "
+                "a two-dimensional sequence."
             )
 
         risk_field = tuple(
-            tuple(float(cell) for cell in row)
+            tuple(
+                float(cell)
+                for cell in row
+            )
             for row in value
         )
 
         if len(risk_field) != rows:
             raise ValueError(
-                "Risk-field row count must match the grid size."
+                "Risk-field row count must match "
+                "the grid size."
             )
 
-        if any(len(row) != columns for row in risk_field):
+        if any(
+            len(row) != columns
+            for row in risk_field
+        ):
             raise ValueError(
-                "Risk-field column count must match the grid size."
+                "Risk-field column count must match "
+                "the grid size."
             )
 
         return risk_field
 
-    def _is_terminated(
-        self,
+    @staticmethod
+    def _validate_action(
         state: State,
-    ) -> bool:
-        """Return whether an agent has reached a target."""
+        action: Action,
+    ) -> None:
+        """Validate an Action against the current State."""
 
-        target_locations = set(state.target_locations)
+        if not 0 <= action.agent_id < len(
+            state.agent_positions
+        ):
+            raise IndexError(
+                f"Invalid agent_id: {action.agent_id}"
+            )
 
-        return any(
-            agent_position in target_locations
-            for agent_position in state.agent_poses
-        )
+        if action.timestep != state.timestep:
+            raise ValueError(
+                "Action timestep does not match "
+                "the current state: "
+                f"action={action.timestep}, "
+                f"state={state.timestep}"
+            )
 
     def _validate_next_state(
         self,
@@ -490,84 +647,179 @@ class GridWorld:
         current_state: State,
         next_state: State,
     ) -> None:
-        """Validate the output produced by the transition model."""
+        """Validate output produced by the transition model."""
 
-        expected_timestep = current_state.timestep + 1
+        expected_timestep = (
+            current_state.timestep + 1
+        )
 
         if next_state.timestep != expected_timestep:
             raise ValueError(
-                "The transition model must increment timestep by one. "
+                "The transition model must increment "
+                "timestep by one. "
                 f"Expected {expected_timestep}, "
                 f"received {next_state.timestep}."
             )
 
-        if len(next_state.agent_poses) != len(
-            current_state.agent_poses
+        if len(next_state.agent_positions) != len(
+            current_state.agent_positions
         ):
             raise ValueError(
-                "The transition model cannot change the number of agents."
+                "The transition model cannot change "
+                "the number of agents."
             )
 
-        for coordinate in next_state.agent_poses:
-            if not self._is_inside_map(coordinate):
+        if (
+            next_state.target_location
+            != current_state.target_location
+        ):
+            raise ValueError(
+                "The transition model changed the "
+                "static target location."
+            )
+
+        if next_state.risk_field != current_state.risk_field:
+            raise ValueError(
+                "The transition model changed the "
+                "static risk field."
+            )
+
+        for coordinate in next_state.agent_positions:
+            if not self._is_inside_map(
+                coordinate
+            ):
                 raise ValueError(
-                    "The transition model produced an out-of-bounds "
-                    f"position: {coordinate}."
+                    "The transition model produced "
+                    "an out-of-bounds position: "
+                    f"{coordinate}."
                 )
 
             if coordinate in self.obstacles:
                 raise ValueError(
-                    "The transition model placed an agent on an obstacle: "
+                    "The transition model placed "
+                    "an agent on an obstacle: "
                     f"{coordinate}."
                 )
+
+    def _duplicate_count(
+        self,
+        *,
+        action: Action,
+        next_state: State,
+    ) -> int:
+        """Return duplicate physical-coverage count for this step.
+
+        Current baseline definition:
+
+        A duplicate event occurs when the acting agent ends the step
+        on a cell that had already been physically visited earlier in
+        the episode.
+
+        This helper can later be replaced if the canonical definition
+        uses sensor-footprint coverage rather than physical visitation.
+        """
+
+        position = next_state.agent_positions[
+            action.agent_id
+        ]
+
+        return int(
+            position in self._visited_cells
+        )
+
+    @staticmethod
+    def _collision_count(
+        state: State,
+    ) -> int:
+        """Return the number of agent-position collisions.
+
+        A collision is detected when two or more agents occupy the
+        same cell in the resulting state.
+        """
+
+        positions = state.agent_positions
+
+        return len(positions) - len(
+            set(positions)
+        )
+
+    def _update_visited_cells(
+        self,
+        state: State,
+    ) -> None:
+        """Add current agent positions to visitation history."""
+
+        self._visited_cells.update(
+            state.agent_positions
+        )
+
+    def _is_terminated(
+        self,
+        state: State,
+    ) -> bool:
+        """Return whether the target is physically found."""
+
+        return (
+            state.target_location
+            in state.agent_positions
+        )
 
     def _is_inside_map(
         self,
         coordinate: Coordinate,
     ) -> bool:
+        """Return whether a coordinate lies inside the grid.
+
+        Coordinate convention is ``(x, y)``.
+        """
+
         rows, columns = self.grid_size
-        row, column = coordinate
+
+        x, y = coordinate
 
         return (
-            0 <= row < rows
-            and 0 <= column < columns
+            0 <= x < columns
+            and 0 <= y < rows
         )
-
-    @staticmethod
-    def _validate_agent_id(
-        *,
-        state: State,
-        agent_id: int,
-    ) -> None:
-        if not 0 <= agent_id < len(state.agent_poses):
-            raise IndexError(
-                f"Invalid agent_id: {agent_id}"
-            )
 
     @staticmethod
     def _parse_coordinate(
         value: Any,
     ) -> Coordinate:
+        """Parse one ``(x, y)`` coordinate."""
+
         if (
-            not isinstance(value, list | tuple)
+            not isinstance(
+                value,
+                (list, tuple),
+            )
             or len(value) != 2
         ):
             raise ValueError(
                 f"Invalid coordinate: {value!r}"
             )
 
-        return int(value[0]), int(value[1])
+        return (
+            int(value[0]),
+            int(value[1]),
+        )
 
     @staticmethod
     def _require_mapping(
         config: Mapping[str, Any],
         key: str,
     ) -> Mapping[str, Any]:
+        """Return a required YAML mapping section."""
+
         value = config.get(key)
 
-        if not isinstance(value, Mapping):
+        if not isinstance(
+            value,
+            Mapping,
+        ):
             raise TypeError(
-                f"Configuration section {key!r} must be a mapping."
+                f"Configuration section "
+                f"{key!r} must be a mapping."
             )
 
         return value
@@ -576,6 +828,8 @@ class GridWorld:
     def _load_yaml(
         path: Path,
     ) -> Mapping[str, Any]:
+        """Load a benchmark YAML configuration."""
+
         if not path.exists():
             raise FileNotFoundError(
                 f"Benchmark instance not found: {path}"
@@ -585,9 +839,14 @@ class GridWorld:
             "r",
             encoding="utf-8",
         ) as file:
-            config = yaml.safe_load(file)
+            config = yaml.safe_load(
+                file
+            )
 
-        if not isinstance(config, Mapping):
+        if not isinstance(
+            config,
+            Mapping,
+        ):
             raise TypeError(
                 "The YAML root must be a mapping."
             )
